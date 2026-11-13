@@ -1,0 +1,409 @@
+diff --git a/firmware/main/launcher.c b/firmware/main/launcher.c
+--- a/firmware/main/launcher.c
++++ b/firmware/main/launcher.c
+@@ -6,6 +6,7 @@
+ #include "esp_log.h"
+ #include "esp_spiffs.h"
+ #include "esp_timer.h"
++#include "esp_lv_adapter_koi.h"
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+@@ -36,7 +37,7 @@
+     lv_timer_t *timer=lv_display_get_refr_timer(display);
+     if (!timer) return;
+     lv_timer_set_period(timer,enabled?KOI_REFRESH_MS:LV_DEF_REFR_PERIOD);
+-    (void)esp_lv_adapter_fps_stats_enable(display,enabled);
++    koi_panel_set_mode(enabled);
+     koi_fast=enabled;
+     koi_prepared=false;
+     if (enabled) {
+@@ -71,6 +72,10 @@
+         runtime_event(1,koi_frame_ms,KOI_HZ);
+         for (unsigned i=0;i<KOI_DRAIN_LIMIT && runtime_state()==APP_RUNNING;i++)
+             runtime_event(10,koi_frame_ms,KOI_HZ);
++        if (runtime_state()==APP_RUNNING) {
++            lv_timer_ready(lv_display_get_refr_timer(bsp_display_get()));
++            koi_panel_wake();
++        }
+         bsp_display_unlock();
+         koi_prepared=false;
+         if (runtime_state()==APP_RUNNING) koi_presented++;
+@@ -86,14 +91,15 @@
+ unsigned launcher_poll_ms(void) { return koi_fast?1u:10u; }
+ 
+ void launcher_koi_fps(void) {
+-    uint32_t fps=0;
+-    int flush_fps=-1;
+-    if (koi_fast && koi_try_display()) {
+-        if (esp_lv_adapter_get_fps(bsp_display_get(),&fps)==ESP_OK) flush_fps=(int)fps;
+-        bsp_display_unlock();
+-    }
+-    printf("KOI_FPS active=%u target=%u present_hz=%u flush_fps=%d dropped=%u\n",
+-           (unsigned)koi_fast,koi_fast?(unsigned)KOI_HZ:0u,koi_presented_hz,flush_fps,koi_dropped);
++    koi_panel_stats_t stats;
++    koi_panel_snapshot(&stats);
++    printf("KOI_FPS active=%u target=%u present_hz=%u flush_fps=%u dropped=%u batch=sparse"
++           " te_us=%lu wait_us=%lu dma_us=%lu gap_us=%lu max_gap_us=%lu"
++           " frames=%u areas=%u shared=%u extra_waits=%u timeouts=%u\n",
++           (unsigned)koi_fast,koi_fast?(unsigned)KOI_HZ:0u,koi_presented_hz,stats.fps,koi_dropped,
++           (unsigned long)stats.te_period_us,(unsigned long)stats.wait_us,(unsigned long)stats.dma_us,
++           (unsigned long)stats.frame_gap_us,(unsigned long)stats.max_frame_gap_us,
++           stats.frames,stats.areas,stats.shared,stats.extra_waits,stats.timeouts);
+ }
+ 
+ #define T(zh,en) ui_text((zh),(en))
+diff --git a/build_cached.py b/build_cached.py
+--- a/build_cached.py
++++ b/build_cached.py
+@@ -20,10 +20,11 @@
+ ADAPTER = "esp-idf/espressif__esp_lvgl_adapter/libespressif__esp_lvgl_adapter.a"
+ 
+ 
+-def compile_object(entry, source, output, cwd):
++def compile_object(entry, source, output, cwd, canonical_adapter):
+     flags, separator, object_and_source = entry["command"].rpartition(" -o ")
+     if not separator or " -c " not in object_and_source:
+         raise ValueError(f"Unexpected compiler invocation for {entry['file']}")
++    flags = flags.replace(canonical_adapter.as_posix(), (ROOT / "adapter").as_posix())
+     command = (
+         f'{flags} -DCONFIG_ESP_LVGL_ADAPTER_ENABLE_FPS_STATS=1 '
+         f'-o "{output.as_posix()}" -c "{source.as_posix()}"'
+@@ -32,7 +33,7 @@
+     print(f"Built {output.name}", flush=True)
+ 
+ 
+-def main(reference):
++def main(reference, compiled_base):
+     reference = reference.resolve()
+     source = ROOT / "firmware/main"
+     output = ROOT / "cached"
+@@ -44,13 +45,21 @@
+     entries = json.loads((reference / "compile_commands.json").read_text(encoding="utf-8"))
+     replacements = {MAIN: [], ADAPTER: []}
+     jobs = []
++    main_sources = {"launcher.c"}
++    if not compiled_base:
++        main_sources.add("main.c")
++    canonical_adapter = next(Path(entry["file"]) for entry in entries
++                             if "__idf_espressif__esp_lvgl_adapter.dir" in entry["command"])
++    adapter_index = canonical_adapter.parts.index("espressif__esp_lvgl_adapter")
++    canonical_adapter = Path(*canonical_adapter.parts[:adapter_index+1])
+     for entry in entries:
+         path = Path(entry["file"])
+         cmd = entry["command"]
+-        if "__idf_main.dir" in cmd and path.name in {"main.c", "launcher.c"}:
++        if "__idf_main.dir" in cmd and path.name in main_sources:
+             archive, path = MAIN, source / path.name
+         elif "__idf_espressif__esp_lvgl_adapter.dir" in cmd:
+             archive = ADAPTER
++            path = ROOT / "adapter" / path.relative_to(canonical_adapter)
+         else:
+             continue
+         object_name = PureWindowsPath(cmd.rpartition(" -o ")[2].partition(" -c ")[0]).name
+@@ -58,22 +67,23 @@
+         if obj in replacements[archive]:
+             raise ValueError(f"Duplicate archive member: {object_name}")
+         replacements[archive].append(obj)
+-        jobs.append((entry, path, obj, reference))
+-    if len(replacements[MAIN]) != 2 or not replacements[ADAPTER]:
++        jobs.append((entry, path, obj, reference, canonical_adapter))
++    if len(replacements[MAIN]) != len(main_sources) or not replacements[ADAPTER]:
+         raise ValueError("Missing reference compile entries")
+     with ThreadPoolExecutor(max_workers=4) as executor:
+         for job in [executor.submit(compile_object, *args) for args in jobs]:
+             job.result()
+ 
+     for archive, objects in replacements.items():
+-        source_lib = reference / archive
++        source_lib = (compiled_base / Path(archive).name) if compiled_base else reference / archive
+         new_lib = output / source_lib.name
+         ar = TOOLCHAIN / "riscv32-esp-elf-ar.exe"
+         members = subprocess.check_output([ar, "t", source_lib], text=True).splitlines()
+         if not set(obj.name for obj in objects) <= set(members):
+             raise ValueError(f"Unexpected archive contents: {source_lib}")
+         shutil.copyfile(source_lib, new_lib)
+-        subprocess.run([ar, "rcsD", new_lib, *objects], check=True)
++        if objects:
++            subprocess.run([ar, "rcsD", new_lib, *objects], check=True)
+         if subprocess.check_output([ar, "t", new_lib], text=True).splitlines() != members:
+             raise ValueError(f"Archive member order changed: {new_lib}")
+ 
+@@ -103,7 +113,7 @@
+         "-o", bin_path, elf_path,
+     ], check=True)
+     image = bin_path.read_bytes()
+-    if len(image) > 0x500000 or b"KOI_FPS active=" not in image:
++    if len(image) > 0x500000 or b"KOI_FPS active=" not in image or b"batch=sparse" not in image:
+         raise ValueError("Candidate image is oversized or lacks the Koi diagnostics")
+     print(f"{bin_path}: {len(image)} bytes, SHA256 {hashlib.sha256(image).hexdigest()}", flush=True)
+     subprocess.run([PYTHON, "-m", "esptool", "--chip", "esp32s31", "image-info", bin_path], check=True)
+@@ -112,4 +122,6 @@
+ if __name__ == "__main__":
+     parser = argparse.ArgumentParser(description=__doc__)
+     parser.add_argument("--reference", type=Path, default=Path("C:/esp/mini-app-mosaico-build/build"))
+-    main(parser.parse_args().reference)
++    parser.add_argument("--compiled-base", type=Path, help="Read the first Koi candidate's prepared archives")
++    args = parser.parse_args()
++    main(args.reference, args.compiled_base)
+diff --git a/adapter/include/esp_lv_adapter_koi.h b/adapter/include/esp_lv_adapter_koi.h
+--- /dev/null
++++ b/adapter/include/esp_lv_adapter_koi.h
+@@ -0,0 +1,18 @@
++#pragma once
++
++#include <stdbool.h>
++#include <stdint.h>
++
++typedef struct {
++    unsigned fps, frames, areas, shared, extra_waits, timeouts;
++    uint32_t te_period_us, wait_us, dma_us;
++    uint32_t frame_gap_us, max_frame_gap_us;
++} koi_panel_stats_t;
++
++/* Mode and wake operations are called under the adapter display mutex. */
++void koi_panel_set_mode(bool enabled);
++bool koi_panel_mode(void);
++void koi_panel_wake(void);
++void koi_panel_snapshot(koi_panel_stats_t *out);
++void koi_panel_record(bool last, bool shared, bool extra_wait, bool timeout,
++                      uint32_t period, uint32_t wait, uint32_t dma);
+diff --git a/adapter/src/adapter/esp_lv_adapter.c b/adapter/src/adapter/esp_lv_adapter.c
+--- a/adapter/src/adapter/esp_lv_adapter.c
++++ b/adapter/src/adapter/esp_lv_adapter.c
+@@ -23,6 +23,7 @@
+ #include "esp_heap_caps.h"
+ #include "lvgl.h"
+ #include "esp_lv_adapter.h"
++#include "esp_lv_adapter_koi.h"
+ #include "adapter_internal.h"
+ #include "display_manager.h"
+ #include "display_bridge.h"
+@@ -33,6 +34,69 @@
+ 
+ /* Global adapter context */
+ static esp_lv_adapter_context_t s_ctx;
++
++static bool s_koi_mode;
++static portMUX_TYPE s_koi_stats_lock = portMUX_INITIALIZER_UNLOCKED;
++static koi_panel_stats_t s_koi_stats;
++static int64_t s_koi_since_us, s_koi_previous_frame_us;
++static unsigned s_koi_window_frames;
++
++void koi_panel_set_mode(bool enabled)
++{
++    s_koi_mode = enabled;
++    if (!enabled) return;
++    portENTER_CRITICAL(&s_koi_stats_lock);
++    s_koi_stats = (koi_panel_stats_t){0};
++    s_koi_since_us = esp_timer_get_time();
++    s_koi_previous_frame_us = 0;
++    s_koi_window_frames = 0;
++    portEXIT_CRITICAL(&s_koi_stats_lock);
++}
++
++bool koi_panel_mode(void) { return s_koi_mode; }
++
++void koi_panel_wake(void)
++{
++    if (s_ctx.task) xTaskNotifyGive(s_ctx.task);
++}
++
++void koi_panel_snapshot(koi_panel_stats_t *out)
++{
++    portENTER_CRITICAL(&s_koi_stats_lock);
++    *out = s_koi_stats;
++    portEXIT_CRITICAL(&s_koi_stats_lock);
++}
++
++void koi_panel_record(bool last, bool shared, bool extra_wait, bool timeout,
++                      uint32_t period, uint32_t wait, uint32_t dma)
++{
++    const int64_t now = esp_timer_get_time();
++    portENTER_CRITICAL(&s_koi_stats_lock);
++    s_koi_stats.areas++;
++    s_koi_stats.shared += shared;
++    s_koi_stats.extra_waits += extra_wait;
++    s_koi_stats.timeouts += timeout;
++    s_koi_stats.te_period_us = period;
++    if (!shared) s_koi_stats.wait_us = wait;
++    s_koi_stats.dma_us = dma;
++    if (last) {
++        s_koi_stats.frames++;
++        s_koi_window_frames++;
++        if (s_koi_previous_frame_us) {
++            uint32_t gap = (uint32_t)(now - s_koi_previous_frame_us);
++            s_koi_stats.frame_gap_us = gap;
++            if (gap > s_koi_stats.max_frame_gap_us) s_koi_stats.max_frame_gap_us = gap;
++        }
++        s_koi_previous_frame_us = now;
++        int64_t elapsed = now - s_koi_since_us;
++        if (elapsed >= 1000000) {
++            s_koi_stats.fps = (unsigned)(((int64_t)s_koi_window_frames*1000000 + elapsed/2)/elapsed);
++            s_koi_since_us = now;
++            s_koi_window_frames = 0;
++        }
++    }
++    portEXIT_CRITICAL(&s_koi_stats_lock);
++}
+ 
+ #if CONFIG_ESP_LVGL_ADAPTER_ENABLE_FREETYPE && LVGL_VERSION_MAJOR < 9
+ /* LVGL v8 FreeType library initialization state */
+diff --git a/adapter/src/display/display_te_sync.c b/adapter/src/display/display_te_sync.c
+--- a/adapter/src/display/display_te_sync.c
++++ b/adapter/src/display/display_te_sync.c
+@@ -19,6 +19,8 @@
+     SemaphoreHandle_t te_vsync_sem;
+     portMUX_TYPE lock;
+     uint32_t last_te_ticks;         /*!< Last TE interrupt tick count (IRAM safe) */
++    int64_t raw_edge_us;
++    uint32_t raw_period_us;
+     TickType_t tvdh_ticks;          /*!< Tvdh in ticks for tick-based comparison */
+     TickType_t frame_request_ticks; /*!< Tick count when the current frame request started */
+     uint8_t window_percent;         /*!< Allowed TE window percentage */
+@@ -153,8 +155,13 @@
+     }
+ 
+     BaseType_t need_yield = pdFALSE;
++    const int64_t now_us = esp_timer_get_time();
+     portENTER_CRITICAL_ISR(&ctx->lock);
+     ctx->last_te_ticks = xTaskGetTickCountFromISR();  /* IRAM safe */
++    const int64_t period = now_us - ctx->raw_edge_us;
++    if (ctx->raw_edge_us && period >= 4000 && period <= 50000) ctx->raw_period_us = (uint32_t)period;
++    else ctx->raw_period_us = 0;
++    ctx->raw_edge_us = now_us;
+     portEXIT_CRITICAL_ISR(&ctx->lock);
+ 
+     xSemaphoreGiveFromISR(ctx->te_vsync_sem, &need_yield);
+@@ -166,6 +173,18 @@
+ bool esp_lv_adapter_te_sync_is_enabled(const esp_lv_adapter_te_sync_config_t *cfg)
+ {
+     return cfg && cfg->gpio_num >= 0;
++}
++
++void esp_lv_adapter_te_sync_raw_edge(esp_lv_adapter_te_sync_context_t *ctx,
++                                    int64_t *edge_us, uint32_t *period_us)
++{
++    *edge_us = 0;
++    *period_us = 0;
++    if (!ctx) return;
++    portENTER_CRITICAL(&ctx->lock);
++    *edge_us = ctx->raw_edge_us;
++    *period_us = ctx->raw_period_us;
++    portEXIT_CRITICAL(&ctx->lock);
+ }
+ 
+ /**
+diff --git a/adapter/src/display/display_te_sync.h b/adapter/src/display/display_te_sync.h
+--- a/adapter/src/display/display_te_sync.h
++++ b/adapter/src/display/display_te_sync.h
+@@ -6,6 +6,7 @@
+ #pragma once
+ 
+ #include <stddef.h>
++#include <stdint.h>
+ #include "freertos/FreeRTOS.h"
+ #include "esp_err.h"
+ #include "esp_lv_adapter_display.h"
+@@ -24,6 +25,8 @@
+ void esp_lv_adapter_te_sync_destroy(esp_lv_adapter_te_sync_context_t *ctx);
+ void esp_lv_adapter_te_sync_begin_frame(esp_lv_adapter_te_sync_context_t *ctx, size_t transfer_bytes);
+ esp_err_t esp_lv_adapter_te_sync_wait_for_vsync(esp_lv_adapter_te_sync_context_t *ctx);
++void esp_lv_adapter_te_sync_raw_edge(esp_lv_adapter_te_sync_context_t *ctx,
++                                    int64_t *edge_us, uint32_t *period_us);
+ void esp_lv_adapter_te_sync_record_tx_start(esp_lv_adapter_te_sync_context_t *ctx);
+ void esp_lv_adapter_te_sync_record_tx_done(esp_lv_adapter_te_sync_context_t *ctx);
+ 
+diff --git a/adapter/src/display/bridge/v9/lvgl_bridge_v9.c b/adapter/src/display/bridge/v9/lvgl_bridge_v9.c
+--- a/adapter/src/display/bridge/v9/lvgl_bridge_v9.c
++++ b/adapter/src/display/bridge/v9/lvgl_bridge_v9.c
+@@ -28,6 +28,7 @@
+ #include "display_manager.h"
+ #include "lvgl_port_ppa.h"
+ #include "display_te_sync.h"
++#include "esp_lv_adapter_koi.h"
+ #if LVGL_VERSION_MAJOR >= 9
+ #include "lvgl_private.h"
+ #endif
+@@ -116,6 +117,8 @@
+     bool frame_buf_submit_pending;
+     SemaphoreHandle_t double_wait_sem;
+     TaskHandle_t notify_task;
++    int64_t koi_edge_us;
++    bool koi_te_started;
+     TaskHandle_t dummy_draw_wait_task;
+     uint32_t dummy_draw_wait_mask;
+     bool dummy_draw;
+@@ -1997,16 +2000,33 @@
+     }
+ 
+     size_t flush_size = (size_t)lv_area_get_size(area) * bridge_color_bytes(impl);
+-
+-    /* Notify TE sync to start a new frame */
+-    if (impl->cfg.te_ctx) {
++    const bool fast = koi_panel_mode();
++    const bool last = lv_display_flush_is_last(disp);
++    int64_t started = fast ? esp_timer_get_time() : 0, edge = 0;
++    uint32_t period = 0;
++    bool shared = false, extra_wait = false, timeout = false;
++    if (fast && impl->cfg.te_ctx) {
++        esp_lv_adapter_te_sync_raw_edge(impl->cfg.te_ctx, &edge, &period);
++        /* The first region still waits for TE. Later regions can share its
++         * physical window only while the raw pulse is unchanged and enough
++         * of the first 66% of that period remains. Budget 25% plus 0.9ms
++         * above the 40MHz quad bus payload time for DMA/command overhead. */
++        const uint32_t window = (period < 16667u ? period : 16667u) * 66u / 100u;
++        const size_t transfer = (flush_size + 19u)/20u + (flush_size + 79u)/80u + 900u;
++        shared = impl->koi_te_started && edge && edge==impl->koi_edge_us &&
++                 started>=edge && (uint64_t)(started-edge)+transfer <= window;
++        extra_wait = impl->koi_te_started && !shared;
++        impl->koi_te_started = true;
++    }
++    if (impl->cfg.te_ctx && !shared) {
+         esp_lv_adapter_te_sync_begin_frame(impl->cfg.te_ctx, flush_size);
+-    }
+-
+-    /* Wait for TE signal to avoid tearing */
+-    if (impl->cfg.te_ctx) {
+-        (void)esp_lv_adapter_te_sync_wait_for_vsync(impl->cfg.te_ctx);
+-    }
++        timeout = esp_lv_adapter_te_sync_wait_for_vsync(impl->cfg.te_ctx)!=ESP_OK;
++        if (fast) {
++            esp_lv_adapter_te_sync_raw_edge(impl->cfg.te_ctx, &edge, &period);
++            impl->koi_edge_us = timeout ? 0 : edge;
++        }
++    }
++    const int64_t dma_started = fast ? esp_timer_get_time() : 0;
+ 
+     if (impl->cfg.te_ctx) {
+         esp_lv_adapter_te_sync_record_tx_start(impl->cfg.te_ctx);
+@@ -2017,19 +2037,19 @@
+     esp_err_t ret = esp_lcd_panel_draw_bitmap(panel_handle, offsetx1, offsety1, offsetx2 + 1, offsety2 + 1, color_map);
+     if (ret != ESP_OK) {
+         ESP_LOGE(TAG, "Draw bitmap failed: %s", esp_err_to_name(ret));
+-        if (impl->cfg.te_ctx) {
+-            esp_lv_adapter_te_sync_record_tx_done(impl->cfg.te_ctx);
+-        }
+-        display_manager_flush_ready(disp);
+-        return;
+-    }
+-
+-    /* Wait for transmission to complete */
+-    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
++    } else {
++        /* Wait for transmission to complete. */
++        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
++    }
+     if (impl->cfg.te_ctx) {
+         esp_lv_adapter_te_sync_record_tx_done(impl->cfg.te_ctx);
+     }
+-
++    if (fast) {
++        koi_panel_record(last && ret==ESP_OK, shared, extra_wait, timeout, period,
++                         (uint32_t)(dma_started-started),
++                         (uint32_t)(esp_timer_get_time()-dma_started));
++    }
++    if (last) { impl->koi_te_started=false; impl->koi_edge_us=0; }
+     display_manager_flush_ready(disp);
+ }
+ 

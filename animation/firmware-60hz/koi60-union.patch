@@ -1,0 +1,154 @@
+diff --git a/firmware/main/hal_mosaico.c b/firmware/main/hal_mosaico.c
+--- a/firmware/main/hal_mosaico.c
++++ b/firmware/main/hal_mosaico.c
+@@ -12,6 +12,8 @@
+ #include "esp_heap_caps.h"
+ static lv_obj_t *scene_canvas;
+ static void *scene_pixels;
++static bool image_batch, image_dirty;
++static lv_area_t image_area;
+ LV_FONT_DECLARE(garden_font);
+ static lv_obj_t *canvas;
+ static bool storage_ready;
+@@ -66,6 +68,16 @@
+     free(scene_pixels); scene_pixels=NULL;
+     canvas=object; objects=0;
+ }
++/* Called with the display locked. Blits update pixels immediately, while
++ * their invalidation is merged to give the TE bridge one partial transfer. */
++void hal_image_batch_begin(void) {
++    image_batch=true;
++    image_dirty=false;
++}
++void hal_image_batch_end(void) {
++    if (scene_canvas && image_dirty) lv_obj_invalidate_area(scene_canvas,&image_area);
++    image_batch=image_dirty=false;
++}
+ int hal_scene(const scene_cmd_t *commands,unsigned count,uint32_t background) {
+     if (!canvas || !bsp_display_lock(200)) return -1;
+     if (!scene_canvas) {
+@@ -107,7 +119,14 @@
+     lv_draw_buf_flush_cache(buf,&area);
+     lv_area_t origin; lv_obj_get_coords(scene_canvas,&origin);
+     lv_area_move(&area,origin.x1,origin.y1);
+-    lv_obj_invalidate_area(scene_canvas,&area);
++    if (image_batch) {
++        if (image_dirty) {
++            image_area.x1=LV_MIN(image_area.x1,area.x1);
++            image_area.y1=LV_MIN(image_area.y1,area.y1);
++            image_area.x2=LV_MAX(image_area.x2,area.x2);
++            image_area.y2=LV_MAX(image_area.y2,area.y2);
++        } else { image_area=area; image_dirty=true; }
++    } else lv_obj_invalidate_area(scene_canvas,&area);
+     bsp_display_unlock(); return 0;
+ }
+ void hal_clear(uint32_t rgb) {
+diff --git a/firmware/main/launcher.c b/firmware/main/launcher.c
+--- a/firmware/main/launcher.c
++++ b/firmware/main/launcher.c
+@@ -68,9 +68,11 @@
+     }
+     if (koi_prepared && koi_try_display()) {
+         /* Scene and image imports reenter this same recursive mutex. */
++        hal_image_batch_begin();
+         runtime_event(1,koi_frame_ms,KOI_HZ);
+         for (unsigned i=0;i<KOI_DRAIN_LIMIT && runtime_state()==APP_RUNNING;i++)
+             runtime_event(10,koi_frame_ms,KOI_HZ);
++        hal_image_batch_end();
+         bsp_display_unlock();
+         koi_prepared=false;
+         if (runtime_state()==APP_RUNNING) koi_presented++;
+@@ -92,7 +94,7 @@
+         if (esp_lv_adapter_get_fps(bsp_display_get(),&fps)==ESP_OK) flush_fps=(int)fps;
+         bsp_display_unlock();
+     }
+-    printf("KOI_FPS active=%u target=%u present_hz=%u flush_fps=%d dropped=%u\n",
++    printf("KOI_FPS active=%u target=%u present_hz=%u flush_fps=%d dropped=%u batch=union\n",
+            (unsigned)koi_fast,koi_fast?(unsigned)KOI_HZ:0u,koi_presented_hz,flush_fps,koi_dropped);
+ }
+ 
+diff --git a/firmware/main/platform.h b/firmware/main/platform.h
+--- a/firmware/main/platform.h
++++ b/firmware/main/platform.h
+@@ -58,6 +58,8 @@
+ #include "scene_render.h"
+ int hal_scene(const scene_cmd_t *commands,unsigned count,uint32_t background);
+ int hal_image_rgb565(int x,int y,int w,int h,const void *pixels);
++void hal_image_batch_begin(void);
++void hal_image_batch_end(void);
+ void environment_snapshot(environment_t *out);
+ void environment_init(void);
+ esp_err_t environment_configure(const char *argument);
+diff --git a/build_cached.py b/build_cached.py
+--- a/build_cached.py
++++ b/build_cached.py
+@@ -32,7 +32,7 @@
+     print(f"Built {output.name}", flush=True)
+ 
+ 
+-def main(reference):
++def main(reference, compiled_base):
+     reference = reference.resolve()
+     source = ROOT / "firmware/main"
+     output = ROOT / "cached"
+@@ -44,12 +44,15 @@
+     entries = json.loads((reference / "compile_commands.json").read_text(encoding="utf-8"))
+     replacements = {MAIN: [], ADAPTER: []}
+     jobs = []
++    main_sources = {"launcher.c", "hal_mosaico.c"}
++    if not compiled_base:
++        main_sources.add("main.c")
+     for entry in entries:
+         path = Path(entry["file"])
+         cmd = entry["command"]
+-        if "__idf_main.dir" in cmd and path.name in {"main.c", "launcher.c"}:
++        if "__idf_main.dir" in cmd and path.name in main_sources:
+             archive, path = MAIN, source / path.name
+-        elif "__idf_espressif__esp_lvgl_adapter.dir" in cmd:
++        elif not compiled_base and "__idf_espressif__esp_lvgl_adapter.dir" in cmd:
+             archive = ADAPTER
+         else:
+             continue
+@@ -59,21 +62,22 @@
+             raise ValueError(f"Duplicate archive member: {object_name}")
+         replacements[archive].append(obj)
+         jobs.append((entry, path, obj, reference))
+-    if len(replacements[MAIN]) != 2 or not replacements[ADAPTER]:
++    if len(replacements[MAIN]) != len(main_sources) or (not compiled_base and not replacements[ADAPTER]):
+         raise ValueError("Missing reference compile entries")
+     with ThreadPoolExecutor(max_workers=4) as executor:
+         for job in [executor.submit(compile_object, *args) for args in jobs]:
+             job.result()
+ 
+     for archive, objects in replacements.items():
+-        source_lib = reference / archive
++        source_lib = (compiled_base / Path(archive).name) if compiled_base else reference / archive
+         new_lib = output / source_lib.name
+         ar = TOOLCHAIN / "riscv32-esp-elf-ar.exe"
+         members = subprocess.check_output([ar, "t", source_lib], text=True).splitlines()
+         if not set(obj.name for obj in objects) <= set(members):
+             raise ValueError(f"Unexpected archive contents: {source_lib}")
+         shutil.copyfile(source_lib, new_lib)
+-        subprocess.run([ar, "rcsD", new_lib, *objects], check=True)
++        if objects:
++            subprocess.run([ar, "rcsD", new_lib, *objects], check=True)
+         if subprocess.check_output([ar, "t", new_lib], text=True).splitlines() != members:
+             raise ValueError(f"Archive member order changed: {new_lib}")
+ 
+@@ -103,7 +107,7 @@
+         "-o", bin_path, elf_path,
+     ], check=True)
+     image = bin_path.read_bytes()
+-    if len(image) > 0x500000 or b"KOI_FPS active=" not in image:
++    if len(image) > 0x500000 or b"KOI_FPS active=" not in image or b"batch=union" not in image:
+         raise ValueError("Candidate image is oversized or lacks the Koi diagnostics")
+     print(f"{bin_path}: {len(image)} bytes, SHA256 {hashlib.sha256(image).hexdigest()}", flush=True)
+     subprocess.run([PYTHON, "-m", "esptool", "--chip", "esp32s31", "image-info", bin_path], check=True)
+@@ -112,4 +116,6 @@
+ if __name__ == "__main__":
+     parser = argparse.ArgumentParser(description=__doc__)
+     parser.add_argument("--reference", type=Path, default=Path("C:/esp/mini-app-mosaico-build/build"))
+-    main(parser.parse_args().reference)
++    parser.add_argument("--compiled-base", type=Path, help="Read the first Koi candidate's prepared archives")
++    args = parser.parse_args()
++    main(args.reference, args.compiled_base)

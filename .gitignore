@@ -1,0 +1,27 @@
+__pycache__/
+*.py[cod]
+/.venv/
+/.vscode/
+/build/
+*.log
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Generated firmware, local recordings, and publishing materials.
+/animation/dist/
+/animation/firmware-60hz/*.bin
+/animation/native-pond/main/assets/*.mp3
+/animation/native-pond/build/
+/animation/native-pond/managed_components/
+/animation/native-pond/sdkconfig
+/animation/native-pond/sdkconfig.old
+/animation/视频素材/
+/animation/*.html
+/animation/*富文本素材清单.json
+/公众号/
+/多平台分发/
+*.zip

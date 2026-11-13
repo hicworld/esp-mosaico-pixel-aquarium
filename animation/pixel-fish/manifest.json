@@ -1,0 +1,13 @@
+{
+  "manifest_version": 1,
+  "api_version": 1,
+  "id": "com.hefan.pixelfish",
+  "name": "Pixel Koi",
+  "version": "1.3.0",
+  "platform_min": "0.5.0",
+  "entry": "main.wasm",
+  "permissions": ["display", "touch", "storage", "audio"],
+  "hardware": ["display", "touch"],
+  "optional_hardware": ["speaker"],
+  "description": "带水面光影和背景音乐的俯视锦鲤池。轻点投食，双击重播，长按校正倒影方向。"
+}

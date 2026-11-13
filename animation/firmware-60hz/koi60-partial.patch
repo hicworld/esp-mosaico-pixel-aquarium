@@ -1,0 +1,130 @@
+diff --git a/firmware/main/launcher.c b/firmware/main/launcher.c
+--- a/firmware/main/launcher.c
++++ b/firmware/main/launcher.c
+@@ -28,6 +28,7 @@
+ static int64_t koi_next_us, koi_stats_since_us;
+ static uint32_t koi_frame_ms;
+ static unsigned koi_presented, koi_dropped, koi_presented_hz;
++static lv_display_render_mode_t koi_saved_render_mode;
+ 
+ /* Caller holds the adapter's recursive display mutex. */
+ static void koi_set_fast(bool enabled) {
+@@ -36,6 +37,10 @@
+     if (!display) return;
+     lv_timer_t *timer=lv_display_get_refr_timer(display);
+     if (!timer) return;
++    if (enabled) {
++        koi_saved_render_mode=lv_display_get_render_mode(display);
++        lv_display_set_render_mode(display,LV_DISPLAY_RENDER_MODE_PARTIAL);
++    } else lv_display_set_render_mode(display,koi_saved_render_mode);
+     lv_timer_set_period(timer,enabled?KOI_REFRESH_MS:LV_DEF_REFR_PERIOD);
+     koi_panel_set_mode(enabled);
+     koi_fast=enabled;
+@@ -93,13 +98,14 @@
+ void launcher_koi_fps(void) {
+     koi_panel_stats_t stats;
+     koi_panel_snapshot(&stats);
+-    printf("KOI_FPS active=%u target=%u present_hz=%u flush_fps=%u dropped=%u batch=sparse"
++    printf("KOI_FPS active=%u target=%u present_hz=%u flush_fps=%u dropped=%u batch=partial"
+            " te_us=%lu wait_us=%lu dma_us=%lu gap_us=%lu max_gap_us=%lu"
+-           " frames=%u areas=%u shared=%u extra_waits=%u timeouts=%u\n",
++           " frames=%u areas=%u shared=%u extra_waits=%u timeouts=%u pixels=%lu\n",
+            (unsigned)koi_fast,koi_fast?(unsigned)KOI_HZ:0u,koi_presented_hz,stats.fps,koi_dropped,
+            (unsigned long)stats.te_period_us,(unsigned long)stats.wait_us,(unsigned long)stats.dma_us,
+            (unsigned long)stats.frame_gap_us,(unsigned long)stats.max_frame_gap_us,
+-           stats.frames,stats.areas,stats.shared,stats.extra_waits,stats.timeouts);
++           stats.frames,stats.areas,stats.shared,stats.extra_waits,stats.timeouts,
++           (unsigned long)stats.frame_pixels);
+ }
+ 
+ #define T(zh,en) ui_text((zh),(en))
+diff --git a/build_cached.py b/build_cached.py
+--- a/build_cached.py
++++ b/build_cached.py
+@@ -58,6 +58,8 @@
+         if "__idf_main.dir" in cmd and path.name in main_sources:
+             archive, path = MAIN, source / path.name
+         elif "__idf_espressif__esp_lvgl_adapter.dir" in cmd:
++            if compiled_base and path.name not in {"esp_lv_adapter.c", "lvgl_bridge_v9.c"}:
++                continue
+             archive = ADAPTER
+             path = ROOT / "adapter" / path.relative_to(canonical_adapter)
+         else:
+@@ -113,7 +115,7 @@
+         "-o", bin_path, elf_path,
+     ], check=True)
+     image = bin_path.read_bytes()
+-    if len(image) > 0x500000 or b"KOI_FPS active=" not in image or b"batch=sparse" not in image:
++    if len(image) > 0x500000 or b"KOI_FPS active=" not in image or b"batch=partial" not in image:
+         raise ValueError("Candidate image is oversized or lacks the Koi diagnostics")
+     print(f"{bin_path}: {len(image)} bytes, SHA256 {hashlib.sha256(image).hexdigest()}", flush=True)
+     subprocess.run([PYTHON, "-m", "esptool", "--chip", "esp32s31", "image-info", bin_path], check=True)
+diff --git a/adapter/include/esp_lv_adapter_koi.h b/adapter/include/esp_lv_adapter_koi.h
+--- a/adapter/include/esp_lv_adapter_koi.h
++++ b/adapter/include/esp_lv_adapter_koi.h
+@@ -7,6 +7,7 @@
+     unsigned fps, frames, areas, shared, extra_waits, timeouts;
+     uint32_t te_period_us, wait_us, dma_us;
+     uint32_t frame_gap_us, max_frame_gap_us;
++    uint32_t frame_pixels;
+ } koi_panel_stats_t;
+ 
+ /* Mode and wake operations are called under the adapter display mutex. */
+@@ -15,4 +16,4 @@
+ void koi_panel_wake(void);
+ void koi_panel_snapshot(koi_panel_stats_t *out);
+ void koi_panel_record(bool last, bool shared, bool extra_wait, bool timeout,
+-                      uint32_t period, uint32_t wait, uint32_t dma);
++                      uint32_t period, uint32_t wait, uint32_t dma, uint32_t pixels);
+diff --git a/adapter/src/adapter/esp_lv_adapter.c b/adapter/src/adapter/esp_lv_adapter.c
+--- a/adapter/src/adapter/esp_lv_adapter.c
++++ b/adapter/src/adapter/esp_lv_adapter.c
+@@ -40,6 +40,7 @@
+ static koi_panel_stats_t s_koi_stats;
+ static int64_t s_koi_since_us, s_koi_previous_frame_us;
+ static unsigned s_koi_window_frames;
++static uint32_t s_koi_frame_pixels;
+ 
+ void koi_panel_set_mode(bool enabled)
+ {
+@@ -50,6 +51,7 @@
+     s_koi_since_us = esp_timer_get_time();
+     s_koi_previous_frame_us = 0;
+     s_koi_window_frames = 0;
++    s_koi_frame_pixels = 0;
+     portEXIT_CRITICAL(&s_koi_stats_lock);
+ }
+ 
+@@ -68,7 +70,7 @@
+ }
+ 
+ void koi_panel_record(bool last, bool shared, bool extra_wait, bool timeout,
+-                      uint32_t period, uint32_t wait, uint32_t dma)
++                      uint32_t period, uint32_t wait, uint32_t dma, uint32_t pixels)
+ {
+     const int64_t now = esp_timer_get_time();
+     portENTER_CRITICAL(&s_koi_stats_lock);
+@@ -79,7 +81,10 @@
+     s_koi_stats.te_period_us = period;
+     if (!shared) s_koi_stats.wait_us = wait;
+     s_koi_stats.dma_us = dma;
++    s_koi_frame_pixels += pixels;
+     if (last) {
++        s_koi_stats.frame_pixels = s_koi_frame_pixels;
++        s_koi_frame_pixels = 0;
+         s_koi_stats.frames++;
+         s_koi_window_frames++;
+         if (s_koi_previous_frame_us) {
+diff --git a/adapter/src/display/bridge/v9/lvgl_bridge_v9.c b/adapter/src/display/bridge/v9/lvgl_bridge_v9.c
+--- a/adapter/src/display/bridge/v9/lvgl_bridge_v9.c
++++ b/adapter/src/display/bridge/v9/lvgl_bridge_v9.c
+@@ -2047,7 +2047,8 @@
+     if (fast) {
+         koi_panel_record(last && ret==ESP_OK, shared, extra_wait, timeout, period,
+                          (uint32_t)(dma_started-started),
+-                         (uint32_t)(esp_timer_get_time()-dma_started));
++                         (uint32_t)(esp_timer_get_time()-dma_started),
++                         ret==ESP_OK ? (uint32_t)lv_area_get_size(area) : 0);
+     }
+     if (last) { impl->koi_te_started=false; impl->koi_edge_us=0; }
+     display_manager_flush_ready(disp);

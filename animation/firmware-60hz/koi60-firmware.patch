@@ -1,0 +1,184 @@
+diff --git a/firmware/main/launcher.c b/firmware/main/launcher.c
+--- a/firmware/main/launcher.c
++++ b/firmware/main/launcher.c
+@@ -3,7 +3,9 @@
+ #include "nand_storage.h"
+ #include "bsp/esp_mosaico.h"
+ #include "freertos/queue.h"
++#include "esp_log.h"
+ #include "esp_spiffs.h"
++#include "esp_timer.h"
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+@@ -19,6 +21,81 @@
+ static int selected=-1;
+ static system_update_info_t available_system_update;
+ static bool has_system_update;
++
++enum { KOI_HZ=60, KOI_FRAME_US=16667, KOI_REFRESH_MS=16, KOI_DRAIN_LIMIT=3 };
++static bool koi_fast, koi_prepared;
++static int64_t koi_next_us, koi_stats_since_us;
++static uint32_t koi_frame_ms;
++static unsigned koi_presented, koi_dropped, koi_presented_hz;
++
++/* Caller holds the adapter's recursive display mutex. */
++static void koi_set_fast(bool enabled) {
++    if (koi_fast==enabled) return;
++    lv_display_t *display=bsp_display_get();
++    if (!display) return;
++    lv_timer_t *timer=lv_display_get_refr_timer(display);
++    if (!timer) return;
++    lv_timer_set_period(timer,enabled?KOI_REFRESH_MS:LV_DEF_REFR_PERIOD);
++    (void)esp_lv_adapter_fps_stats_enable(display,enabled);
++    koi_fast=enabled;
++    koi_prepared=false;
++    if (enabled) {
++        koi_next_us=koi_stats_since_us=esp_timer_get_time();
++        koi_presented=koi_dropped=koi_presented_hz=0;
++    }
++}
++
++static bool koi_try_display(void) {
++    /* Busy is expected here; avoid logging once per polling attempt. */
++    const char *tag="esp_lvgl:adapter";
++    esp_log_level_t level=esp_log_level_get(tag);
++    esp_log_level_set(tag,ESP_LOG_NONE);
++    bool locked=bsp_display_lock(0);
++    esp_log_level_set(tag,level);
++    return locked;
++}
++
++static void koi_tick(void) {
++    int64_t now_us=esp_timer_get_time();
++    if (now_us>=koi_next_us) {
++        unsigned due=(unsigned)((now_us-koi_next_us)/KOI_FRAME_US+1);
++        koi_next_us+=(int64_t)due*KOI_FRAME_US;
++        koi_dropped+=due-1+koi_prepared;
++        koi_frame_ms=(uint32_t)(now_us/1000);
++        /* Events 9/10 with b=60 are private to this app version. */
++        runtime_event(9,koi_frame_ms,KOI_HZ);
++        koi_prepared=runtime_state()==APP_RUNNING;
++    }
++    if (koi_prepared && koi_try_display()) {
++        /* Scene and image imports reenter this same recursive mutex. */
++        runtime_event(1,koi_frame_ms,KOI_HZ);
++        for (unsigned i=0;i<KOI_DRAIN_LIMIT && runtime_state()==APP_RUNNING;i++)
++            runtime_event(10,koi_frame_ms,KOI_HZ);
++        bsp_display_unlock();
++        koi_prepared=false;
++        if (runtime_state()==APP_RUNNING) koi_presented++;
++    }
++    int64_t elapsed_us=now_us-koi_stats_since_us;
++    if (elapsed_us>=1000000) {
++        koi_presented_hz=(unsigned)(((int64_t)koi_presented*1000000+elapsed_us/2)/elapsed_us);
++        koi_stats_since_us=now_us;
++        koi_presented=0;
++    }
++}
++
++unsigned launcher_poll_ms(void) { return koi_fast?1u:10u; }
++
++void launcher_koi_fps(void) {
++    uint32_t fps=0;
++    int flush_fps=-1;
++    if (koi_fast && koi_try_display()) {
++        if (esp_lv_adapter_get_fps(bsp_display_get(),&fps)==ESP_OK) flush_fps=(int)fps;
++        bsp_display_unlock();
++    }
++    printf("KOI_FPS active=%u target=%u present_hz=%u flush_fps=%d dropped=%u\n",
++           (unsigned)koi_fast,koi_fast?(unsigned)KOI_HZ:0u,koi_presented_hz,flush_fps,koi_dropped);
++}
++
+ #define T(zh,en) ui_text((zh),(en))
+ void launcher_post(ui_message_t msg) { if (queue) xQueueSend(queue,&msg,0); }
+ static void action(lv_event_t *e) {
+@@ -92,6 +169,7 @@
+     return T("无效","Invalid");
+ }
+ static void reset_screen(const char *title,bool nav) {
++    koi_set_fast(false);
+     network_setup_close(); hal_set_canvas(NULL); lv_obj_clean(root); status=NULL;hardware_notice=NULL;hardware_notice_until=0;
+     /* Keep CJK glyphs available for language choices and app names in English. */
+     lv_obj_set_style_text_font(root,&garden_font,0);
+@@ -293,6 +371,13 @@
+     lv_obj_set_style_bg_opa(canvas,LV_OPA_COVER,0); lv_obj_add_flag(canvas,LV_OBJ_FLAG_CLICKABLE);
+     lv_obj_add_event_cb(canvas,touched,LV_EVENT_ALL,NULL); hal_set_canvas(canvas); bsp_display_unlock();
+     if (runtime_start(&listed[index])!=ESP_OK) { launcher_refresh(); launcher_status(runtime_error());return; }
++    int version_order;
++    if (!strcmp(listed[index].id,"com.hefan.pixelfish") &&
++        compare_versions(listed[index].version,"1.2.0",&version_order) && version_order>=0 &&
++        !(listed[index].permissions&PERM_NETWORK) && bsp_display_lock(200)) {
++        koi_set_fast(true);
++        bsp_display_unlock();
++    }
+     uint32_t missing=runtime_missing_optional_hardware();
+     if(missing&&bsp_display_lock(200)) {
+         char names[96],text[150];platform_hardware_names(missing,ui_language_is_chinese(),names,sizeof(names));
+@@ -386,7 +471,10 @@
+     if(hardware_notice&&now>=hardware_notice_until&&bsp_display_lock(50)) {
+         lv_obj_delete(hardware_notice);hardware_notice=NULL;hardware_notice_until=0;bsp_display_unlock();
+     }
+-    if (now-last_tick>=50) { last_tick=now; runtime_event(1,(uint32_t)now,0); }
++    if (koi_fast) {
++        if (runtime_state()==APP_RUNNING) koi_tick();
++        else if (koi_try_display()) { koi_set_fast(false); bsp_display_unlock(); }
++    } else if (now-last_tick>=50) { last_tick=now; runtime_event(1,(uint32_t)now,0); }
+     if (page==2 && now-last_status>=1000) { last_status=now; settings_text(); }
+     if (runtime_state()==APP_CRASHED) { runtime_stop(); launcher_refresh(); launcher_status(runtime_error()); }
+ }
+diff --git a/firmware/main/main.c b/firmware/main/main.c
+--- a/firmware/main/main.c
++++ b/firmware/main/main.c
+@@ -37,6 +37,7 @@
+     esp_err_t err=ESP_OK;
+     if (!strcmp(line,"help")) puts("help | status | hardware | selftest | list | library | settings | language [zh|en] | bundle INDEX | store https://.../index.json | store_refresh | store_list | store_install INDEX | run APP_ID | stop | reboot | download | wifi SSID|PASSWORD | install https://... | remove APP_ID | clear APP_ID | ota https://... | ota_check | format CONFIRM | storage | nand | nand_test | nand_format CONFIRM | apps_migrate | apps_check | cache | upload_begin/upload_chunk/upload_commit/upload_abort");
+     else if (!strcmp(line,"status")) diagnostics_print();
++    else if (!strcmp(line,"koi_fps")) launcher_koi_fps();
+     else if (!strcmp(line,"hardware")) {
+         char names[180];uint32_t available=platform_hardware_available();
+         platform_hardware_names(available,false,names,sizeof(names));printf("HARDWARE available=0x%08lx names=%s\n",(unsigned long)available,names);
+@@ -168,7 +169,7 @@
+                 used=0; overflow=false; memset(line,0,sizeof(line));
+             } else if (used<sizeof(line)-1) line[used++]=c; else overflow=true;
+         }
+-        vTaskDelay(pdMS_TO_TICKS(10));
++        vTaskDelay(pdMS_TO_TICKS(launcher_poll_ms()));
+     }
+     return NULL;
+ }
+diff --git a/firmware/main/platform.h b/firmware/main/platform.h
+--- a/firmware/main/platform.h
++++ b/firmware/main/platform.h
+@@ -145,6 +145,8 @@
+ void launcher_init(void);
+ void launcher_refresh(void);
+ void launcher_tick(void);
++unsigned launcher_poll_ms(void);
++void launcher_koi_fps(void);
+ void launcher_post(ui_message_t message);
+ void launcher_status(const char *text);
+ size_t catalog_count(void);
+diff --git a/firmware/sdkconfig b/firmware/sdkconfig
+--- a/firmware/sdkconfig
++++ b/firmware/sdkconfig
+@@ -3994,7 +3994,7 @@
+ # default:
+ # CONFIG_ESP_LVGL_ADAPTER_LVGL_THREAD_STACK_IN_PSRAM is not set
+ # default:
+-# CONFIG_ESP_LVGL_ADAPTER_ENABLE_FPS_STATS is not set
++CONFIG_ESP_LVGL_ADAPTER_ENABLE_FPS_STATS=y
+ # default:
+ # CONFIG_ESP_LVGL_ADAPTER_ENABLE_BUTTON is not set
+ # default:
+diff --git a/firmware/sdkconfig.defaults b/firmware/sdkconfig.defaults
+--- a/firmware/sdkconfig.defaults
++++ b/firmware/sdkconfig.defaults
+@@ -14,6 +14,7 @@
+ CONFIG_LV_COLOR_DEPTH_16=y
+ CONFIG_LV_OS_FREERTOS=y
+ CONFIG_LV_DEF_REFR_PERIOD=30
++CONFIG_ESP_LVGL_ADAPTER_ENABLE_FPS_STATS=y
+ CONFIG_LV_DPI_DEF=60
+ CONFIG_LV_USE_CLIB_MALLOC=y
+ CONFIG_LV_USE_CLIB_STRING=y
