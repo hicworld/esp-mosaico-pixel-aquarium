@@ -1,15 +1,26 @@
 param(
     [string]$BuildRoot = 'C:\esp\koi-pond-native',
-    [string]$EspEnvironment = 'C:\Espressif\tools\Microsoft.release-v6.1.PowerShell_profile.ps1',
+    [string]$EspEnvironment = '',
     [switch]$StageOnly,
-    [string]$Platform = 'C:\esp\koi60-build\src\firmware',
-    [string]$Adapter = 'C:\esp\koi60-partial\adapter'
+    [string]$Platform = '',
+    [string]$Adapter = ''
 )
 $ErrorActionPreference = 'Stop'
-$source = python (Join-Path $PSScriptRoot 'stage.py') $BuildRoot --platform $Platform --adapter $Adapter
+if (-not $StageOnly) {
+    if ($EspEnvironment) {
+        if (!(Test-Path -LiteralPath $EspEnvironment -PathType Leaf)) { throw 'ESP-IDF environment script was not found.' }
+        . $EspEnvironment
+    }
+    if (!(Get-Command idf.py -ErrorAction SilentlyContinue)) {
+        throw 'Activate an ESP-IDF 6.1 environment or provide -EspEnvironment.'
+    }
+}
+$stageArguments = @((Join-Path $PSScriptRoot 'stage.py'), $BuildRoot)
+if ($Platform) { $stageArguments += @('--platform', $Platform) }
+if ($Adapter) { $stageArguments += @('--adapter', $Adapter) }
+$source = python @stageArguments
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 if ($StageOnly) { $source; exit }
-. $EspEnvironment
 $env:CMAKE_BUILD_PARALLEL_LEVEL = '8'
 $env:PYTHONUTF8 = '1'
 Push-Location -LiteralPath $source
